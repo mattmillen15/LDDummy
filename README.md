@@ -7,3 +7,7 @@ ___
 ```zsh
 LDDummy.py -u <username> -p <password> -d <domain> -dc <dc-ip> [-o <output_directory>]
 ```
+![image](https://github.com/mattmillen15/LDDummy/assets/68832392/f575e731-ce0c-461e-810e-dd71aaec4ecc)
+___
+![image](https://github.com/mattmillen15/LDDummy/assets/68832392/a99618a5-0b50-4f17-951c-e5589e3962a1)
+___
