@@ -1,19 +1,8 @@
 import argparse
-import atexit
 import json
 import os
-import ssl
 import subprocess
 import sys
-import tempfile
-
-try:
-    import ldap3
-    from ldap3 import Server, Connection, NTLM, SASL, GSSAPI, Tls, ALL
-    from ldapdomaindump import domainDumper, domainDumpConfig
-    HAS_LDAP3 = True
-except ImportError:
-    HAS_LDAP3 = False
 
 
 def check_write_access(directory):
@@ -27,8 +16,7 @@ def check_write_access(directory):
 def _is_signing_error(text):
     t = text.lower()
     return ("strongerauth" in t or "00002028" in t or "80090346" in t
-            or "confidentiality" in t or "integrity required" in t
-            or "data 80090346" in t)
+            or "confidentiality" in t or "integrity required" in t)
 
 
 def _ldapdomaindump_subprocess(domain, username, credential, dc, output_dir, ldaps=False):
@@ -51,12 +39,11 @@ def _ldapdomaindump_subprocess(domain, username, credential, dc, output_dir, lda
 
 
 def _obtain_tgt(username, password, hashes, domain, dc_ip):
-    """Request a Kerberos TGT via impacket. Returns None when an existing ccache should be used."""
+    """Request a TGT via impacket and return the dict for kerberosLogin(TGT=...)."""
     try:
         from impacket.krb5.kerberosv5 import getKerberosTGT, KerberosError
         from impacket.krb5.types import Principal
         from impacket.krb5 import constants as kconst
-        from impacket.krb5.ccache import CCache
         from binascii import unhexlify
     except ImportError:
         print("[-] impacket not installed: pip3 install impacket", file=sys.stderr)
@@ -82,58 +69,132 @@ def _obtain_tgt(username, password, hashes, domain, dc_ip):
         sys.exit(1)
 
     print("[+] TGT acquired.")
-    cc = CCache()
-    cc.fromTGT(tgt, oldSessionKey, sessionKey)
-    fd, path = tempfile.mkstemp(suffix=".ccache", prefix="lddummy_")
-    os.close(fd)
-    cc.saveFile(path)
-    atexit.register(lambda p=path: os.path.exists(p) and os.remove(p))
-    return path
+    return {"KDC_REP": tgt, "cipher": cipher, "sessionKey": sessionKey}
 
 
-def _ldapdomaindump_kerberos(domain, username, password, hashes, dc_ip, dc_host,
-                              output_dir, ccache=None):
-    """Dump via ldap3 GSSAPI (Kerberos) — satisfies signing and bypasses EPA."""
-    if not HAS_LDAP3:
-        print("[-] ldap3/ldapdomaindump not installed.", file=sys.stderr)
+def _get_base_dn(ic, domain):
+    """Read defaultNamingContext from RootDSE; fall back to constructing from domain."""
+    try:
+        from impacket.ldap.ldapasn1 import Scope as LDAPScope
+        resp = ic.search(
+            searchBase="", searchFilter="(objectClass=*)",
+            scope=LDAPScope("baseObject"),
+            attributes=["defaultNamingContext"])
+        for entry in resp:
+            try:
+                for a in entry["attributes"]:
+                    if str(a["type"]) == "defaultNamingContext":
+                        return str(a["vals"][0])
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return ",".join(f"DC={p}" for p in domain.split("."))
+
+
+def _impacket_search(ic, base, flt, attrs):
+    """Paged LDAP search via impacket; returns list of attr dicts with bytes values."""
+    from impacket.ldap.ldapasn1 import SimplePagedResultsControl
+    try:
+        from impacket.ldap.ldap import LDAPSearchError
+    except ImportError:
+        LDAPSearchError = Exception
+
+    controls = [SimplePagedResultsControl(size=500)]
+    try:
+        raw = ic.search(searchBase=base, searchFilter=flt,
+                        attributes=attrs, searchControls=controls)
+    except LDAPSearchError as e:
+        raw = e.getAnswers()
+    except Exception as e:
+        print(f"[-] LDAP search error: {e}", file=sys.stderr)
+        return []
+
+    results = []
+    for entry in raw:
+        try:
+            ad = {}
+            for a in entry["attributes"]:
+                ad[str(a["type"])] = [bytes(v) for v in a["vals"]]
+            results.append(ad)
+        except Exception:
+            continue
+    return results
+
+
+def _dump_kerberos(domain, username, password, hashes, dc_ip, dc_host, output_dir, ccache=None):
+    """Kerberos LDAP dump via impacket — satisfies signing and bypasses EPA/channel binding."""
+    try:
+        from impacket.ldap import ldap as ildap
+    except ImportError:
+        print("[-] impacket not installed: pip3 install impacket", file=sys.stderr)
         sys.exit(1)
 
-    # Resolve credentials
+    # Resolve TGT source
+    tgt_dict = None
+    lm, nt = "", ""
+    if hashes:
+        parts = hashes.split(":", 1)
+        lm, nt = (parts[0], parts[1]) if len(parts) == 2 else ("", parts[0])
+
     if ccache:
         os.environ["KRB5CCNAME"] = os.path.abspath(ccache)
         print(f"[*] Using existing ccache: {ccache}")
     elif password or hashes:
-        ccache_path = _obtain_tgt(username, password, hashes, domain, dc_ip)
-        os.environ["KRB5CCNAME"] = os.path.abspath(ccache_path)
+        tgt_dict = _obtain_tgt(username, password, hashes, domain, dc_ip)
     elif os.environ.get("KRB5CCNAME"):
         print(f"[*] Using ccache from KRB5CCNAME: {os.environ['KRB5CCNAME']}")
     else:
         print("[-] Kerberos requires -p, -H, --ccache, or KRB5CCNAME.", file=sys.stderr)
         sys.exit(1)
 
-    # Kerberos needs the FQDN for the ldap/<fqdn> SPN — IP won't work
     target = dc_host or dc_ip
-    if target == dc_ip and not dc_host:
-        print("[!] No --dc-host supplied; using IP for the SPN. "
-              "Pass --dc-host <fqdn> if the bind fails.")
-
-    tls = ldap3.Tls(validate=ssl.CERT_NONE)
-    server = Server(target, port=389, use_ssl=False, tls=tls, get_info=ALL)
-    print(f"[*] Connecting to {target}:389 via Kerberos (GSSAPI)...")
+    url = f"ldap://{target}"
+    print(f"[*] Connecting to {target}:389 via Kerberos...")
     try:
-        conn = Connection(server, authentication=SASL, sasl_mechanism=GSSAPI,
-                          auto_bind=True, check_names=False)
+        ic = ildap.LDAPConnection(url, "", dc_ip)
+        ic.kerberosLogin(username, password or "", domain,
+                         lmhash=lm, nthash=nt, aesKey="",
+                         kdcHost=dc_ip, TGT=tgt_dict,
+                         useCache=(tgt_dict is None))
     except Exception as e:
         print(f"[-] Kerberos LDAP bind failed: {e}", file=sys.stderr)
         sys.exit(1)
 
     print("[+] Kerberos LDAP bind successful.")
 
-    config = domainDumpConfig()
-    config.basepath = output_dir
-    dumper = domainDumper(server, conn, config)
-    dumper.domainDump()
-    print(f"[+] ldapdomaindump completed. Output saved to {output_dir}")
+    base_dn = _get_base_dn(ic, domain)
+    print(f"[*] Base DN: {base_dn}")
+
+    # Users
+    print("[*] Enumerating users...")
+    user_entries = _impacket_search(
+        ic, base_dn,
+        "(&(objectClass=user)(!(objectClass=computer)))",
+        ["sAMAccountName"])
+    users = sorted({
+        bytes(ad["sAMAccountName"][0]).decode(errors="replace").lower()
+        for ad in user_entries if "sAMAccountName" in ad
+    })
+    users_file = os.path.join(output_dir, "users.txt")
+    with open(users_file, "w") as f:
+        f.write("\n".join(users) + ("\n" if users else ""))
+    print(f"[+] {len(users)} users -> {users_file}")
+
+    # Computers
+    print("[*] Enumerating computers...")
+    comp_entries = _impacket_search(
+        ic, base_dn,
+        "(objectClass=computer)",
+        ["dNSHostName"])
+    computers = sorted({
+        bytes(ad["dNSHostName"][0]).decode(errors="replace").lower()
+        for ad in comp_entries if "dNSHostName" in ad
+    })
+    comp_file = os.path.join(output_dir, "computers.txt")
+    with open(comp_file, "w") as f:
+        f.write("\n".join(computers) + ("\n" if computers else ""))
+    print(f"[+] {len(computers)} computers -> {comp_file}")
 
 
 def extract_and_save_attributes(json_file, attribute, output_file):
@@ -188,7 +249,7 @@ def main():
     parser.add_argument("--ldaps", action="store_true",
                         help="Force LDAPS (port 636) — satisfies signing enforcement")
     parser.add_argument("-k", "--kerberos", action="store_true",
-                        help="Use Kerberos (GSSAPI) — bypasses signing and channel binding")
+                        help="Use Kerberos via impacket — bypasses signing and channel binding")
     parser.add_argument("--ccache", default=None,
                         help="Path to an existing Kerberos ccache file")
 
@@ -201,15 +262,13 @@ def main():
     output_dir = args.output or os.path.join(os.getcwd(), "ldapdomaindump_output")
     check_write_access(output_dir)
 
-    # ── Kerberos path ──────────────────────────────────────────────────────────
+    # ── Kerberos path (impacket) ───────────────────────────────────────────────
     if args.kerberos or args.ccache:
-        _ldapdomaindump_kerberos(
-            args.domain, args.username, args.password, args.hashes,
-            args.dc, args.dc_host, output_dir, ccache=args.ccache)
-        process_output_files(output_dir)
+        _dump_kerberos(args.domain, args.username, args.password, args.hashes,
+                       args.dc, args.dc_host, output_dir, ccache=args.ccache)
         return
 
-    # ── NTLM path (plain LDAP or LDAPS) ───────────────────────────────────────
+    # ── NTLM path (ldapdomaindump subprocess, plain LDAP or LDAPS) ────────────
     credential = args.password or args.hashes
     success, err = _ldapdomaindump_subprocess(
         args.domain, args.username, credential, args.dc, output_dir, ldaps=args.ldaps)
