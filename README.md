@@ -3,35 +3,52 @@ Just a dumb wrapper for ldapdomaindump to get a plain user and computer list....
 
 Shameless rip off of https://github.com/fin3ss3g0d/ldd_json_parser.sh, but built to be a one hitta quitta...
 
-Now with support for DCs that enforce **LDAP signing** and **channel binding** (EPA).
+Auto-negotiates authentication — handles **LDAP signing**, **channel binding** (EPA), and **pass-the-hash** automatically. Just provide credentials and it figures out the rest.
+
 ___
 # Usage: 
 ```zsh
-# Standard NTLM (auto-falls back to LDAPS if signing is enforced)
-LDDummy.py -u <username> -p <password> -d <domain> -dc <dc-ip> [-o <output_directory>]
+# Standard — auto-negotiates LDAP → LDAPS → Kerberos as needed
+LDDummy.py -u <username> -p <password> -d <domain> -dc <dc-ip>
 
-# Force LDAPS (port 636) — satisfies signing enforcement
-LDDummy.py -u <username> -p <password> -d <domain> -dc <dc-ip> --ldaps
+# Pass-the-hash — impacket NTLM bind, auto-falls back to Kerberos
+LDDummy.py -u <username> -H <LM:NT> -d <domain> -dc <dc-ip>
 
-# Kerberos — bypasses LDAP signing AND channel binding (EPA/KB5021130)
+# Force Kerberos — bypasses LDAP signing AND channel binding (EPA)
 LDDummy.py -u <username> -p <password> -d <domain> -dc <dc-ip> -k [--dc-host <dc-fqdn>]
 
-# Kerberos with existing ccache (e.g. from getTGT.py or a prior run)
-LDDummy.py -u <username> -d <domain> -dc <dc-ip> -k --ccache <user.ccache>
+# Kerberos with existing ccache
+LDDummy.py -u <username> -d <domain> -dc <dc-ip> --ccache <user.ccache>
 
-# Pass-the-hash + Kerberos (overpass-the-hash)
-LDDummy.py -u <username> -H <LM:NT> -d <domain> -dc <dc-ip> -k --dc-host <dc-fqdn>
+# Force LDAPS (port 636)
+LDDummy.py -u <username> -p <password> -d <domain> -dc <dc-ip> --ldaps
 ```
 
 | Flag | Description |
 |------|-------------|
 | `-p` | Plaintext password |
-| `-H` | NTLM hashes (`LM:NT` or `:NT`) |
+| `-H` | NTLM hashes (`LM:NT` or `:NT`) — pass-the-hash via impacket |
 | `--ldaps` | Force LDAPS (port 636) |
-| `-k` / `--kerberos` | Kerberos auth (GSSAPI) — best path when signing/EPA enforced |
-| `--dc-host` | DC FQDN — needed for Kerberos SPN (`ldap/<fqdn>`) |
+| `-k` / `--kerberos` | Force Kerberos auth (GSSAPI) |
+| `--dc-host` | DC FQDN for Kerberos SPN (auto-resolved via reverse DNS if omitted) |
 | `--ccache` | Use an existing Kerberos ccache file |
 | `-o` | Output directory (default: `./ldapdomaindump_output`) |
+
+### Auth negotiation
+
+**With `-p` (password):**
+1. Plain LDAP via `ldapdomaindump`
+2. If signing enforced → retry LDAPS
+3. If LDAPS fails → auto-request TGT and Kerberos bind via impacket
+
+**With `-H` (hashes):**
+1. NTLM bind via impacket (handles signing + pass-the-hash)
+2. If channel binding enforced → auto-request TGT (overpass-the-hash) and Kerberos bind
+
+**With `-k` or `--ccache`:**
+1. Kerberos bind directly via impacket
+
+DC hostname for Kerberos SPN is auto-resolved via reverse DNS. If reverse DNS fails, provide `--dc-host`.
 
 * Or if you already have LdapDomainDump output (.json files), use the ldd_extractor.py script to extract lowercase users.txt and computers.txt
 ---  
